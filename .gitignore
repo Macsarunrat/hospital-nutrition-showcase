@@ -1,0 +1,45 @@
+# Environment & secrets
+.env
+*.env
+*.pem
+*.key
+*.cert
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Static & Media volumes
+media/
+staticfiles/
+*.sqlite3
+
+# Node / Frontend
+node_modules/
+dist/
+.vite/
+
+# OS specific
+.DS_Store
+Thumbs.db

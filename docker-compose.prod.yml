@@ -1,0 +1,295 @@
+version: '3.8'
+
+# ==============================================================================
+# Hospital Nutrition System — Production Orchestration Specification
+# ==============================================================================
+# Key Architectural Decisions:
+# 1. Reverse Proxy: Traefik v2.11 with dynamic container discovery.
+# 2. Security: Docker Socket Proxy (tecnativa/docker-socket-proxy) sandboxes
+#    Traefik from direct root access to /var/run/docker.sock.
+# 3. Network Isolation: "traefik-internal" has "internal: true" to ensure database
+#    and message broker are not routable from external networks.
+# 4. Dependency Ordering: Uses Docker healthchecks ("condition: service_healthy")
+#    so application containers only start after databases and caches are ready.
+# 5. Worker Reliability: Celery worker restarts child processes every 1,000 tasks
+#    to eliminate C-extension memory leaks from image processing.
+# ==============================================================================
+
+services:
+  # ----------------------------------------------------------------------------
+  # PostgreSQL with pgvector extension (Clinical Data & Vector Embeddings)
+  # ----------------------------------------------------------------------------
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: nutrition_db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - TZ=Asia/Bangkok
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - traefik-internal
+
+  # ----------------------------------------------------------------------------
+  # Redis (Message Broker & Cache)
+  # Configured with hard memory limits and LRU eviction to prevent host OOM.
+  # ----------------------------------------------------------------------------
+  redis:
+    image: redis:alpine
+    container_name: redis
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Bangkok
+    command: >
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - traefik-internal
+
+  # ----------------------------------------------------------------------------
+  # FastAPI AI Inference Microservice
+  # Dedicated lightweight async worker for image processing & model inference.
+  # ----------------------------------------------------------------------------
+  fastapi:
+    build: 
+      context: ./backend-fastapi
+      dockerfile: Dockerfile.prod
+    container_name: fastapi
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - INTERNAL_TOKEN=${INTERNAL_TOKEN}
+      - TZ=Asia/Bangkok
+    networks:
+      - traefik-internal
+
+  # ----------------------------------------------------------------------------
+  # Django Core REST API & Business Logic
+  # Serves static assets via WhiteNoise and handles ORM database operations.
+  # ----------------------------------------------------------------------------
+  django:
+    build: 
+      context: ./backend-django
+      dockerfile: Dockerfile.prod
+    container_name: django
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - media-data:/app/django/media
+    environment:
+      - IN_DOCKER=true
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=${POSTGRES_DB}
+      - DB_USER=${POSTGRES_USER}
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+      - INTERNAL_TOKEN=${INTERNAL_TOKEN}
+      - TZ=Asia/Bangkok
+      - SECRET_KEY=${SECRET_KEY}
+      - DEBUG=${DEBUG:-False}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS}
+      - CSRF_COOKIE_SECURE=${CSRF_COOKIE_SECURE:-True}
+      - URL_PREFIX=${VITE_BASE_PATH}
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL}
+      - FASTAPI_URL=http://fastapi:8001
+      - DJANGO_SUPERUSER_USERNAME=${DJANGO_SUPERUSER_USERNAME}
+      - DJANGO_SUPERUSER_PASSWORD=${DJANGO_SUPERUSER_PASSWORD}
+      - DJANGO_SUPERUSER_EMAIL=${DJANGO_SUPERUSER_EMAIL}
+    labels:
+      - "traefik.enable=true"
+      # Route API requests, Admin panel, and WhiteNoise static files
+      - "traefik.http.routers.api.rule=Host(`${DOMAIN}`) && (PathPrefix(`${VITE_BASE_PATH}api`) || PathPrefix(`${VITE_BASE_PATH}entry-point-55c1`) || PathPrefix(`${VITE_BASE_PATH}static`))"
+      - "traefik.http.routers.api.entrypoints=web"
+      - "traefik.http.services.api.loadbalancer.server.port=8002"
+      # Strip institutional subdirectory prefix before passing request to WSGI
+      - "traefik.http.middlewares.api-strip.stripprefix.prefixes=${STRIP_PREFIX}"
+      - "traefik.http.routers.api.middlewares=api-strip"
+    networks:
+      - traefik-internal
+
+  # ----------------------------------------------------------------------------
+  # Celery Asynchronous Task Worker
+  # Offloads heavy AI prediction jobs without blocking HTTP request threads.
+  # ----------------------------------------------------------------------------
+  celery:
+    build: 
+      context: ./backend-django
+      dockerfile: Dockerfile.prod
+    container_name: celery
+    # --max-tasks-per-child=1000 is critical: recycles worker processes to reclaim
+    # any unmanaged memory from C-libraries (Pillow, OpenCV, etc.)
+    command: celery -A nutritionWebsite worker -l INFO --concurrency=2 --max-tasks-per-child=1000
+    restart: unless-stopped
+    volumes:
+      - media-data:/app/django/media
+    environment:
+      - IN_DOCKER=true
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=${POSTGRES_DB}
+      - DB_USER=${POSTGRES_USER}
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+      - TZ=Asia/Bangkok
+      - INTERNAL_TOKEN=${INTERNAL_TOKEN}
+      - SECRET_KEY=${SECRET_KEY}
+      - DEBUG=${DEBUG:-False}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS}
+      - CSRF_COOKIE_SECURE=${CSRF_COOKIE_SECURE:-True}
+      - URL_PREFIX=${VITE_BASE_PATH}
+      - FASTAPI_URL=http://fastapi:8001
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      django:
+        condition: service_started
+    networks:
+      - traefik-internal
+
+  # ----------------------------------------------------------------------------
+  # Flower: Real-Time Celery Task Monitor
+  # Bound strictly to localhost (127.0.0.1:5555) — NEVER exposed to the public Internet!
+  # ----------------------------------------------------------------------------
+  flower:
+    image: mher/flower:latest
+    container_name: flower
+    restart: unless-stopped
+    environment:
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - FLOWER_PORT=5555
+    ports:
+      - "127.0.0.1:5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - default
+      - traefik-internal
+
+  # ----------------------------------------------------------------------------
+  # Frontend Static Web Server (Nginx + React SPA Production Build)
+  # ----------------------------------------------------------------------------
+  frontend:
+    build: 
+      context: ./frontend-react
+      args:
+        - VITE_API_BASE_URL=${VITE_API_BASE_URL}
+        - VITE_BASE_PATH=${VITE_BASE_PATH}
+    container_name: frontend
+    restart: unless-stopped
+    volumes:
+      - media-data:/app/django/media:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.myapp.rule=Host(`${DOMAIN}`) && PathPrefix(`${VITE_BASE_PATH}`)"
+      - "traefik.http.routers.myapp.entrypoints=web"
+      - "traefik.http.middlewares.frontend-strip.stripprefix.prefixes=${STRIP_PREFIX}"
+      - "traefik.http.routers.myapp.middlewares=frontend-strip"
+    networks:
+      - default
+      - traefik-internal
+
+  # ----------------------------------------------------------------------------
+  # Docker Socket Proxy: Hardened Daemon Gateway
+  # Drops all write permissions to docker.sock. Exposes ONLY safe read queries.
+  # ----------------------------------------------------------------------------
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy
+    container_name: socket-proxy
+    restart: unless-stopped
+    environment:
+      # Explicit read-only allowances for Traefik label inspection
+      - CONTAINERS=1
+      - EVENTS=1
+      - PING=1
+      - VERSION=1
+      # Explicitly keep all dangerous write capabilities disabled (default = 0)
+      - POST=0
+      - DELETE=0
+      - EXEC=0
+      - VOLUMES=0
+      - NETWORKS=0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - traefik-internal
+
+  # ----------------------------------------------------------------------------
+  # Traefik v2.11 Edge Reverse Proxy
+  # Dynamically routes traffic based on container labels via socket-proxy.
+  # ----------------------------------------------------------------------------
+  traefik:
+    image: traefik:v2.11
+    container_name: traefik
+    restart: unless-stopped
+    command:
+      - "--api.insecure=false"           # Insecure web dashboard disabled for production
+      - "--api.dashboard=true"
+      - "--providers.docker=true"
+      # Direct Traefik to talk to the socket proxy, NOT the raw docker.sock
+      - "--providers.docker.endpoint=tcp://socket-proxy:2375"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      # Trust X-Forwarded-* headers from the institutional upstream proxy
+      - "--entrypoints.web.forwardedHeaders.trustedIPs=${TRUSTED_PROXIES}"
+      - "--log.level=INFO"
+      - "--accesslog=true"
+    ports:
+      - "80:80"
+      - "127.0.0.1:8080:8080"           # Dashboard bound to localhost only
+    networks:
+      - default
+      - traefik-internal
+    depends_on:
+      - socket-proxy
+    labels:
+      - "traefik.enable=false"
+
+# ==============================================================================
+# Network & Volume Topologies
+# ==============================================================================
+networks:
+  default:
+    driver: bridge
+  traefik-internal:
+    driver: bridge
+    # internal: true isolates databases and internal microservices from the host's
+    # external interface, preventing any accidental port leaks.
+    internal: true    
+
+volumes:
+  media-data:
+    driver: local
+  pgdata:
+    driver: local
+  redisdata:
+    driver: local

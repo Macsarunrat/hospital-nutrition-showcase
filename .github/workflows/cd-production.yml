@@ -1,0 +1,29 @@
+name: CD Pipeline (Production Deployment)
+
+# Triggered exclusively on pushes to the production branch
+on:
+  push:
+    branches:
+      - production
+
+jobs:
+  deploy-production:
+    name: Trigger Production Deployment
+    runs-on: ubuntu-latest
+
+    # Requires manual reviewer approval configured in GitHub Repository Settings -> Environments -> production.
+    # This prevents unverified pushes from instantly altering the live clinical system.
+    environment: production
+
+    steps:
+      # We trigger a Portainer Stack Webhook rather than storing raw host SSH credentials in GitHub Secrets.
+      # Engineering Rationale:
+      # 1. Least Privilege: The webhook can only command Portainer to pull and rebuild this specific stack,
+      #    preventing any possibility of arbitrary command execution or host compromise via GitHub runner.
+      # 2. Automated Migration: The django container's entrypoint.sh script runs `python manage.py migrate --noinput`
+      #    upon container start, ensuring zero manual intervention during rollout.
+      - name: Trigger Portainer Redeployment Webhook
+        run: |
+          echo "Initiating production rollout via Portainer webhook..."
+          curl -f -sS -X POST "${{ secrets.PORTAINER_DEPLOY_WEBHOOK }}"
+          echo "Deployment webhook successfully triggered."
