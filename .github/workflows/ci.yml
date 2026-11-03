@@ -1,15 +1,10 @@
 name: CI Pipeline (Integration & Quality Gate)
 
-# Triggers on all pushes and PRs targeting main and develop branches
+# Reference specification of the live production integration pipeline.
+# Configured with workflow_dispatch so it serves as an architectural reference
+# without automatically triggering against code-stripped showcase repos.
 on:
-  push:
-    branches:
-      - main
-      - develop
-  pull_request:
-    branches:
-      - main
-      - develop
+  workflow_dispatch:
 
 jobs:
   # ----------------------------------------------------------------------------

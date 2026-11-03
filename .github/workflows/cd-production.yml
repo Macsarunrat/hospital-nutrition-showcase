@@ -1,10 +1,9 @@
 name: CD Pipeline (Production Deployment)
 
-# Triggered exclusively on pushes to the production branch
+# Reference specification of the live production deployment pipeline.
+# Configured with workflow_dispatch so it serves as an architectural reference.
 on:
-  push:
-    branches:
-      - production
+  workflow_dispatch:
 
 jobs:
   deploy-production:
